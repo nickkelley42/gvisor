@@ -197,16 +197,16 @@ func (pc *passContext) checkFieldAccess(inst instructionWithReferrers, structObj
 	pc.pass.ImportObjectFact(fieldObj, &lff)
 	pc.pass.ImportObjectFact(fieldObj, &lgf)
 
-	for guardName, fl := range lgf.GuardedBy {
+	for guardName, gi := range lgf.GuardedBy {
 		guardsFound++
-		r := fl.resolve(structObj)
-		if _, ok := ls.isHeld(r); ok {
+		r := gi.FieldList.resolve(structObj)
+		if _, ok := ls.isHeld(r, !gi.IsRead); ok {
 			guardsHeld++
 			continue
 		}
 		if _, ok := pc.forced[pc.positionKey(inst.Pos())]; ok {
 			// Mark this as locked, since it has been forced.
-			ls.lockField(r)
+			ls.lockField(r, !gi.IsRead)
 			guardsHeld++
 			continue
 		}
@@ -301,7 +301,7 @@ func (pc *passContext) postFunctionCallUpdate(call callCommon, lff *lockFunction
 			continue
 		}
 		r := fg.resolveCall(call.Common().Args, call.Value())
-		if s, ok := ls.unlockField(r); !ok {
+		if s, ok := ls.unlockField(r, !fg.IsRead); !ok {
 			if _, ok := pc.forced[pc.positionKey(call.Pos())]; !ok {
 				pc.maybeFail(call.Pos(), "attempt to release %s (%s), but not held (locks: %s)", fieldName, s, ls.String())
 			}
@@ -315,7 +315,7 @@ func (pc *passContext) postFunctionCallUpdate(call callCommon, lff *lockFunction
 		}
 		// Acquire the lock per the annotation.
 		r := fg.resolveCall(call.Common().Args, call.Value())
-		if s, ok := ls.lockField(r); !ok {
+		if s, ok := ls.lockField(r, !fg.IsRead); !ok {
 			if _, ok := pc.forced[pc.positionKey(call.Pos())]; !ok {
 				pc.maybeFail(call.Pos(), "attempt to acquire %s (%s), but already held (locks: %s)", fieldName, s, ls.String())
 			}
@@ -332,12 +332,12 @@ func (pc *passContext) checkFunctionCall(call callCommon, fn *ssa.Function, lff 
 	// Check all guards required are held.
 	for fieldName, fg := range lff.HeldOnEntry {
 		r := fg.resolveCall(call.Common().Args, call.Value())
-		if s, ok := ls.isHeld(r); !ok {
+		if s, ok := ls.isHeld(r, !fg.IsRead); !ok {
 			if _, ok := pc.forced[pc.positionKey(call.Pos())]; !ok {
 				pc.maybeFail(call.Pos(), "must hold %s (%s) to call %s, but not held (locks: %s)", fieldName, s, fn.Name(), ls.String())
 			} else {
 				// Force the lock to be acquired.
-				ls.lockField(r)
+				ls.lockField(r, !fg.IsRead)
 			}
 		}
 	}
@@ -348,18 +348,31 @@ func (pc *passContext) checkFunctionCall(call callCommon, fn *ssa.Function, lff 
 	// Check if it's a method dispatch for something in the sync package.
 	// See: https://godoc.org/golang.org/x/tools/go/ssa#Function
 	if fn.Package() != nil && fn.Package().Pkg.Name() == "sync" && fn.Signature.Recv() != nil {
+		isWrite := false
 		switch fn.Name() {
-		case "Lock", "RLock":
-			if s, ok := ls.lockField(resolvedValue{value: call.Common().Args[0], valid: true}); !ok {
+		case "Lock":
+			isWrite = true
+			fallthrough
+		case "RLock":
+			if s, ok := ls.lockField(resolvedValue{value: call.Common().Args[0], valid: true}, isWrite); !ok {
 				if _, ok := pc.forced[pc.positionKey(call.Pos())]; !ok {
 					// Double locking a mutex that is already locked.
 					pc.maybeFail(call.Pos(), "%s already locked (locks: %s)", s, ls.String())
 				}
 			}
-		case "Unlock", "RUnlock":
-			if s, ok := ls.unlockField(resolvedValue{value: call.Common().Args[0], valid: true}); !ok {
+		case "Unlock":
+			isWrite = true
+		case "RUnlock":
+			if s, ok := ls.unlockField(resolvedValue{value: call.Common().Args[0], valid: true}, isWrite); !ok {
 				if _, ok := pc.forced[pc.positionKey(call.Pos())]; !ok {
 					// Unlocking something that is already unlocked.
+					pc.maybeFail(call.Pos(), "%s already unlocked (locks: %s)", s, ls.String())
+				}
+			}
+		case "DowngradeLock":
+			if s, ok := ls.downgradeField(resolvedValue{value: call.Common().Args[0], valid: true}); !ok {
+				if _, ok := pc.forced[pc.positionKey(call.Pos())]; !ok {
+					// Downgrading something that may not be downgraded.
 					pc.maybeFail(call.Pos(), "%s already unlocked (locks: %s)", s, ls.String())
 				}
 			}
@@ -531,13 +544,13 @@ func (pc *passContext) checkBasicBlock(fn *ssa.Function, block *ssa.BasicBlock, 
 			// Validate held locks.
 			for fieldName, fg := range lff.HeldOnExit {
 				r := fg.resolveStatic(fn, rv)
-				if s, ok := rls.isHeld(r); !ok {
+				if s, ok := rls.isHeld(r, !fg.IsRead); !ok {
 					if _, ok := pc.forced[pc.positionKey(rv.Pos())]; !ok {
 						pc.maybeFail(rv.Pos(), "lock %s (%s) not held (locks: %s)", fieldName, s, rls.String())
 						failed = true
 					} else {
 						// Force the lock to be acquired.
-						rls.lockField(r)
+						rls.lockField(r, !fg.IsRead)
 					}
 				}
 			}
@@ -601,7 +614,7 @@ func (pc *passContext) checkFunction(call callCommon, fn *ssa.Function, lff *loc
 		// The first is the method object itself so we skip that when looking
 		// for receiver/function parameters.
 		r := fg.resolveStatic(fn, call.Value())
-		if s, ok := ls.lockField(r); !ok {
+		if s, ok := ls.lockField(r, !fg.IsRead); !ok {
 			// This can only happen if the same value is declared
 			// multiple times, and should be caught by the earlier
 			// fact scanning. Keep it here as a sanity check.
