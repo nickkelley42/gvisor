@@ -181,15 +181,7 @@ type SNATTarget struct {
 	NetworkProtocol tcpip.NetworkProtocolNumber
 }
 
-// Action implements Target.Action.
-func (st *SNATTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r *Route, _ AddressableEndpoint) (RuleVerdict, int) {
-	// Sanity check.
-	if st.NetworkProtocol != pkt.NetworkProtocolNumber {
-		panic(fmt.Sprintf(
-			"SNATTarget.Action with NetworkProtocol %d called on packet with NetworkProtocolNumber %d",
-			st.NetworkProtocol, pkt.NetworkProtocolNumber))
-	}
-
+func snatAction(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r *Route, port uint16, address tcpip.Address) (RuleVerdict, int) {
 	// Packet is already manipulated.
 	if pkt.NatDone {
 		return RuleAccept, 0
@@ -199,16 +191,6 @@ func (st *SNATTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r *Rou
 	if pkt.NetworkHeader().View().IsEmpty() || pkt.TransportHeader().View().IsEmpty() {
 		return RuleDrop, 0
 	}
-
-	switch hook {
-	case Postrouting, Input:
-	case Prerouting, Output, Forward:
-		panic(fmt.Sprintf("%s not supported", hook))
-	default:
-		panic(fmt.Sprintf("%s unrecognized", hook))
-	}
-
-	port := st.Port
 
 	if port == 0 {
 		switch protocol := pkt.TransportProtocolNumber; protocol {
@@ -228,11 +210,69 @@ func (st *SNATTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r *Rou
 	// tracking.
 	//
 	// Does nothing if the protocol does not support connection tracking.
-	if conn := ct.insertSNATConn(pkt, hook, port, st.Addr); conn != nil {
+	if conn := ct.insertSNATConn(pkt, hook, port, address); conn != nil {
 		ct.handlePacket(pkt, hook, r)
 	}
 
 	return RuleAccept, 0
+}
+
+// Action implements Target.Action.
+func (st *SNATTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r *Route, _ AddressableEndpoint) (RuleVerdict, int) {
+	// Sanity check.
+	if st.NetworkProtocol != pkt.NetworkProtocolNumber {
+		panic(fmt.Sprintf(
+			"SNATTarget.Action with NetworkProtocol %d called on packet with NetworkProtocolNumber %d",
+			st.NetworkProtocol, pkt.NetworkProtocolNumber))
+	}
+
+	switch hook {
+	case Postrouting, Input:
+	case Prerouting, Output, Forward:
+		panic(fmt.Sprintf("%s not supported", hook))
+	default:
+		panic(fmt.Sprintf("%s unrecognized", hook))
+	}
+
+	return snatAction(pkt, ct, hook, r, st.Port, st.Addr)
+}
+
+// MasqueradeTarget modifies the source port/IP in the outgoing packets.
+type MasqueradeTarget struct {
+	Port uint16
+
+	// NetworkProtocol is the network protocol the target is used with. It
+	// is immutable.
+	NetworkProtocol tcpip.NetworkProtocolNumber
+}
+
+// Action implements Target.Action.
+func (st *MasqueradeTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r *Route, addressEP AddressableEndpoint) (RuleVerdict, int) {
+	// Sanity check.
+	if st.NetworkProtocol != pkt.NetworkProtocolNumber {
+		panic(fmt.Sprintf(
+			"MasqueradeTarget.Action with NetworkProtocol %d called on packet with NetworkProtocolNumber %d",
+			st.NetworkProtocol, pkt.NetworkProtocolNumber))
+	}
+
+	switch hook {
+	case Postrouting:
+	case Prerouting, Input, Forward, Output:
+		panic(fmt.Sprintf("masquerade target is supported only on postrouting hook; hook = %d", hook))
+	default:
+		panic(fmt.Sprintf("%s unrecognized", hook))
+	}
+
+	// addressEP is expected to be set for the postrouting hook.
+	ep := addressEP.AcquireOutgoingPrimaryAddress(pkt.Network().DestinationAddress(), false /* allowExpired */)
+	if ep == nil {
+		// No address exists that we can use as a source address.
+		return RuleDrop, 0
+	}
+
+	address := ep.AddressWithPrefix().Address
+	ep.DecRef()
+	return snatAction(pkt, ct, hook, r, st.Port, address)
 }
 
 func rewritePacket(n header.Network, t header.ChecksummableTransport, updateSRCFields, fullChecksum, updatePseudoHeader bool, newPort uint16, newAddr tcpip.Address) {
