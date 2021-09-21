@@ -315,7 +315,22 @@ type accepted struct {
 	// belong to one list at a time, and endpoints are already stored in the
 	// dispatcher's list.
 	endpoints list.List `state:".([]*endpoint)"`
-	cap       int
+
+	// pendingSynRcvdConnectedEndpoints is a queue of endpoints that originated
+	// from the SYNRCVD queue and became connected at a time where the accept
+	// queue was full.
+	pendingSynRcvdConnectedEndpoints list.List `state:".([]*endpoint)"`
+
+	// synRcvdCount is the number of connections for this endpoint that are either
+	// in:
+	// * the SYN-RCVD state
+	// * the established state, but did not yet make their way to the accept queue
+	//   because it is full
+	synRcvdCount int32
+
+	// cap is the maximum number of endpoints that can be in the accepted endpoint
+	// list.
+	cap int
 }
 
 // endpoint represents a TCP endpoint. This struct serves as the interface
@@ -333,7 +348,7 @@ type accepted struct {
 // The following three mutexes can be acquired independent of e.mu but if
 // acquired with e.mu then e.mu must be acquired first.
 //
-// e.acceptMu -> protects accepted.
+// e.acceptMu -> Protects e.accepted.
 // e.rcvQueueMu -> Protects e.rcvQueue and associated fields.
 // e.sndQueueMu -> Protects the e.sndQueue and associated fields.
 // e.lastErrorMu -> Protects the lastError field.
@@ -497,10 +512,6 @@ type endpoint struct {
 	// and dropped when it is.
 	segmentQueue segmentQueue `state:"wait"`
 
-	// synRcvdCount is the number of connections for this endpoint that are
-	// in SYN-RCVD state; this is only accessed atomically.
-	synRcvdCount int32
-
 	// userMSS if non-zero is the MSS value explicitly set by the user
 	// for this endpoint using the TCP_MAXSEG setsockopt.
 	userMSS uint16
@@ -554,25 +565,13 @@ type endpoint struct {
 	// listener.
 	deferAccept time.Duration
 
-	// pendingAccepted tracks connections queued to be accepted. It is used to
-	// ensure such queued connections are terminated before the accepted queue is
-	// marked closed (by setting its capacity to zero).
-	pendingAccepted sync.WaitGroup `state:"nosave"`
-
 	// acceptMu protects accepted.
 	acceptMu sync.Mutex `state:"nosave"`
-
-	// acceptCond is a condition variable that can be used to block on when
-	// accepted is full and an endpoint is ready to be delivered.
-	//
-	// We use this condition variable to block/unblock goroutines which
-	// tried to deliver an endpoint but couldn't because accept backlog was
-	// full ( See: endpoint.deliverAccepted ).
-	acceptCond *sync.Cond `state:"nosave"`
 
 	// accepted is used by a listening endpoint protocol goroutine to
 	// send newly accepted connections to the endpoint so that they can be
 	// read by Accept() calls.
+	// +checklocks:acceptMu
 	accepted accepted
 
 	// The following are only used from the protocol goroutine, and
@@ -876,7 +875,6 @@ func newEndpoint(s *stack.Stack, protocol *protocol, netProto tcpip.NetworkProto
 
 	e.segmentQueue.ep = e
 
-	e.acceptCond = sync.NewCond(&e.acceptMu)
 	e.keepalive.timer.init(e.stack.Clock(), &e.keepalive.waker)
 
 	return e
@@ -1095,15 +1093,13 @@ func (e *endpoint) closePendingAcceptableConnectionsLocked() {
 		return
 	}
 
-	e.acceptCond.Broadcast()
-
 	// Reset all connections that are waiting to be accepted.
 	for n := acceptedCopy.endpoints.Front(); n != nil; n = n.Next() {
 		n.Value.(*endpoint).notifyProtocolGoroutine(notifyReset)
 	}
-	// Wait for reset of all endpoints that are still waiting to be delivered to
-	// the now closed accepted.
-	e.pendingAccepted.Wait()
+	for n := acceptedCopy.pendingSynRcvdConnectedEndpoints.Front(); n != nil; n = n.Next() {
+		n.Value.(*endpoint).notifyProtocolGoroutine(notifyReset)
+	}
 }
 
 // cleanupLocked frees all resources associated with the endpoint. It is called
@@ -2494,11 +2490,10 @@ func (e *endpoint) listen(backlog int) tcpip.Error {
 				return &tcpip.ErrInvalidEndpointState{}
 			}
 			e.accepted.cap = backlog
+			if e.accepted.deliverPendingEndpointsLocked() {
+				e.waiterQueue.Notify(waiter.ReadableEvents)
+			}
 		}
-
-		// Notify any blocked goroutines that they can attempt to
-		// deliver endpoints again.
-		e.acceptCond.Broadcast()
 
 		return nil
 	}
@@ -2569,16 +2564,15 @@ func (e *endpoint) Accept(peerAddr *tcpip.FullAddress) (tcpip.Endpoint, *waiter.
 	}
 
 	// Get the new accepted endpoint.
-	var n *endpoint
 	e.acceptMu.Lock()
-	if element := e.accepted.endpoints.Front(); element != nil {
-		n = e.accepted.endpoints.Remove(element).(*endpoint)
-	}
+	n, pendingEndpointDelivered := e.accepted.dequeueEndpointLocked()
 	e.acceptMu.Unlock()
 	if n == nil {
 		return nil, nil, &tcpip.ErrWouldBlock{}
 	}
-	e.acceptCond.Signal()
+	if pendingEndpointDelivered {
+		e.waiterQueue.Notify(waiter.ReadableEvents)
+	}
 	if peerAddr != nil {
 		*peerAddr = n.getRemoteAddress()
 	}

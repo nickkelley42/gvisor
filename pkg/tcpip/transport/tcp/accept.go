@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/sleep"
@@ -191,14 +190,6 @@ func (l *listenContext) isCookieValid(id stack.TransportEndpointID, cookie seqnu
 	}
 
 	return (v - l.cookieHash(id, cookieTS, 1)) & hashMask, true
-}
-
-func (l *listenContext) useSynCookies() bool {
-	var alwaysUseSynCookies tcpip.TCPAlwaysUseSynCookies
-	if err := l.stack.TransportProtocolOption(header.TCPProtocolNumber, &alwaysUseSynCookies); err != nil {
-		panic(fmt.Sprintf("TransportProtocolOption(%d, %T) = %s", header.TCPProtocolNumber, alwaysUseSynCookies, err))
-	}
-	return bool(alwaysUseSynCookies) || (l.listenEP != nil && l.listenEP.synRcvdBacklogFull())
 }
 
 // createConnectingEndpoint creates a new endpoint in a connecting state, with
@@ -401,43 +392,6 @@ func (l *listenContext) cleanupCompletedHandshake(h *handshake) {
 	e.h = nil
 }
 
-// deliverAccepted delivers the newly-accepted endpoint to the listener. If the
-// listener has transitioned out of the listen state (accepted is the zero
-// value), the new endpoint is reset instead.
-func (e *endpoint) deliverAccepted(n *endpoint, withSynCookie bool) {
-	e.mu.Lock()
-	e.pendingAccepted.Add(1)
-	e.mu.Unlock()
-	defer e.pendingAccepted.Done()
-
-	// Drop the lock before notifying to avoid deadlock in user-specified
-	// callbacks.
-	delivered := func() bool {
-		e.acceptMu.Lock()
-		defer e.acceptMu.Unlock()
-		for {
-			if e.accepted == (accepted{}) {
-				return false
-			}
-			if e.accepted.endpoints.Len() == e.accepted.cap {
-				e.acceptCond.Wait()
-				continue
-			}
-
-			e.accepted.endpoints.PushBack(n)
-			if !withSynCookie {
-				atomic.AddInt32(&e.synRcvdCount, -1)
-			}
-			return true
-		}
-	}()
-	if delivered {
-		e.waiterQueue.Notify(waiter.ReadableEvents)
-	} else {
-		n.notifyProtocolGoroutine(notifyReset)
-	}
-}
-
 // propagateInheritableOptionsLocked propagates any options set on the listening
 // endpoint to the newly created endpoint.
 //
@@ -489,64 +443,75 @@ func (e *endpoint) notifyAborted() {
 	e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
 }
 
-// handleSynSegment is called in its own goroutine once the listening endpoint
-// receives a SYN segment. It is responsible for completing the handshake and
-// queueing the new endpoint for acceptance.
-//
-// A limited number of these goroutines are allowed before TCP starts using SYN
-// cookies to accept connections.
-//
-// Precondition: if ctx.listenEP != nil, ctx.listenEP.mu must be locked.
-func (e *endpoint) handleSynSegment(ctx *listenContext, s *segment, opts header.TCPSynOptions) tcpip.Error {
-	defer s.decRef()
-
-	h, err := ctx.startHandshake(s, opts, &waiter.Queue{}, e.owner)
-	if err != nil {
-		e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
-		e.stats.FailedConnectionAttempts.Increment()
-		atomic.AddInt32(&e.synRcvdCount, -1)
-		return err
-	}
-
-	go func() {
-		// Note that startHandshake returns a locked endpoint. The
-		// force call here just makes it so.
-		if err := h.complete(); err != nil { // +checklocksforce
-			e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
-			e.stats.FailedConnectionAttempts.Increment()
-			ctx.cleanupFailedHandshake(h)
-			atomic.AddInt32(&e.synRcvdCount, -1)
-			return
-		}
-		ctx.cleanupCompletedHandshake(h)
-		h.ep.startAcceptedLoop()
-		e.stack.Stats().TCP.PassiveConnectionOpenings.Increment()
-		e.deliverAccepted(h.ep, false /*withSynCookie*/)
-	}()
-
-	return nil
-}
-
-func (e *endpoint) synRcvdBacklogFull() bool {
+func (e *endpoint) incrementSynRcvdCounter() bool {
 	e.acceptMu.Lock()
-	acceptedCap := e.accepted.cap
-	e.acceptMu.Unlock()
+	defer e.acceptMu.Unlock()
+
 	// The capacity of the accepted queue would always be one greater than the
 	// listen backlog. But, the SYNRCVD connections count is always checked
 	// against the listen backlog value for Linux parity reason.
 	// https://github.com/torvalds/linux/blob/7acac4b3196/include/net/inet_connection_sock.h#L280
 	//
-	// We maintain an equality check here as the synRcvdCount is incremented
-	// and compared only from a single listener context and the capacity of
-	// the accepted queue can only increase by a new listen call.
-	return int(atomic.LoadInt32(&e.synRcvdCount)) == acceptedCap-1
+	// We maintain an equality check here as the synRcvdCount is incremented and
+	// compared only from a single listener context and the capacity of the
+	// accepted queue can only increase by a new listen call.
+	if int(e.accepted.synRcvdCount) == e.accepted.cap-1 {
+		return false
+	}
+	e.accepted.synRcvdCount++
+	return true
+}
+
+func (e *endpoint) decrementSynRcvdCounter() {
+	e.acceptMu.Lock()
+	e.accepted.decrementSynRcvdCounterLocked()
+	e.acceptMu.Unlock()
+}
+
+func (a *accepted) decrementSynRcvdCounterLocked() {
+	// This function can be called from connecting endpoint goroutines. Make sure
+	// we never decrement a zero counter - because 'accepted' might have been
+	// reset by the listener endpoint and the zero-value of 'accepted' has a
+	// special meaning.
+	if a.synRcvdCount != 0 {
+		a.synRcvdCount--
+	}
 }
 
 func (e *endpoint) acceptQueueIsFull() bool {
 	e.acceptMu.Lock()
-	full := e.accepted != (accepted{}) && e.accepted.endpoints.Len() == e.accepted.cap
+	full := e.accepted.acceptQueueIsFullLocked()
 	e.acceptMu.Unlock()
 	return full
+}
+
+func (a *accepted) acceptQueueIsFullLocked() bool {
+	return a.endpoints.Len() == a.cap
+}
+
+// deliverPendingEndpointsLocked attempts to dequeue pending endpoints and move
+// them in the the accepted endpoints queue.
+func (a *accepted) deliverPendingEndpointsLocked() bool {
+	var delivered bool
+	for !a.acceptQueueIsFullLocked() {
+		pendingElement := a.pendingSynRcvdConnectedEndpoints.Front()
+		if pendingElement == nil {
+			break
+		}
+		a.endpoints.PushBack(a.pendingSynRcvdConnectedEndpoints.Remove(pendingElement))
+		a.synRcvdCount--
+		delivered = true
+	}
+	return delivered
+}
+
+func (a *accepted) dequeueEndpointLocked() (*endpoint, bool) {
+	element := a.endpoints.Front()
+	if element == nil {
+		return nil, false
+	}
+	ep := a.endpoints.Remove(element).(*endpoint)
+	return ep, a.deliverPendingEndpointsLocked()
 }
 
 // handleListenSegment is called when a listening endpoint receives a segment
@@ -580,11 +545,65 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 		}
 
 		opts := parseSynSegmentOptions(s)
-		if !ctx.useSynCookies() {
-			s.incRef()
-			atomic.AddInt32(&e.synRcvdCount, 1)
-			return e.handleSynSegment(ctx, s, opts)
+
+		var alwaysUseSynCookies tcpip.TCPAlwaysUseSynCookies
+		if err := ctx.stack.TransportProtocolOption(header.TCPProtocolNumber, &alwaysUseSynCookies); err != nil {
+			panic(fmt.Sprintf("TransportProtocolOption(%d, %T) = %s", header.TCPProtocolNumber, alwaysUseSynCookies, err))
 		}
+
+		if !bool(alwaysUseSynCookies) && ctx.listenEP != nil && ctx.listenEP.incrementSynRcvdCounter() {
+			// Use the SYNRCVD queue for this connection request.
+			h, err := ctx.startHandshake(s, opts, &waiter.Queue{}, e.owner)
+			if err != nil {
+				e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
+				e.stats.FailedConnectionAttempts.Increment()
+				e.decrementSynRcvdCounter()
+				return err
+			}
+
+			// A limited number of these goroutines are allowed before TCP starts
+			// using SYN cookies to accept connections.
+			go func() {
+				// Note that startHandshake returns a locked endpoint. The
+				// force call here just makes it so.
+				if err := h.complete(); err != nil { // +checklocksforce
+					e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
+					e.stats.FailedConnectionAttempts.Increment()
+					ctx.cleanupFailedHandshake(h)
+					e.decrementSynRcvdCounter()
+					return
+				}
+				ctx.cleanupCompletedHandshake(h)
+				h.ep.startAcceptedLoop()
+				e.stack.Stats().TCP.PassiveConnectionOpenings.Increment()
+
+				e.acceptMu.Lock()
+				if e.accepted == (accepted{}) {
+					// If while we were completing the handshake, the listener has
+					// transitioned out of the listen state (accepted is the zero value),
+					// then we reset the endpoint here.
+					e.acceptMu.Unlock()
+					h.ep.notifyProtocolGoroutine(notifyReset)
+					return
+				}
+
+				if !e.accepted.acceptQueueIsFullLocked() {
+					e.accepted.endpoints.PushBack(h.ep)
+					e.accepted.decrementSynRcvdCounterLocked()
+					e.acceptMu.Unlock()
+					e.waiterQueue.Notify(waiter.ReadableEvents)
+					return
+				}
+
+				// The accept queue is full. Store the endpoint in the pending queue.
+				e.accepted.pendingSynRcvdConnectedEndpoints.PushBack(h.ep)
+				e.acceptMu.Unlock()
+			}()
+
+			return nil
+		}
+
+		// Use SYN cookies for this connection request.
 		route, err := e.stack.FindRoute(s.nicID, s.dstAddr, s.srcAddr, s.netProto, false /* multicastLoop */)
 		if err != nil {
 			return err
@@ -627,12 +646,17 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 		return nil
 
 	case s.flags.Contains(header.TCPFlagAck):
-		if e.acceptQueueIsFull() {
+		// Keep hold of acceptMu until the new endpoint is in the accept queue (or
+		// if there is an error), to guarantee that we will keep our spot in the
+		// queue even if another handshake from the syn queue completes.
+		e.acceptMu.Lock()
+		if e.accepted.acceptQueueIsFullLocked() {
 			// Silently drop the ack as the application can't accept
 			// the connection at this point. The ack will be
 			// retransmitted by the sender anyway and we can
 			// complete the connection at the time of retransmit if
 			// the backlog has space.
+			e.acceptMu.Unlock()
 			e.stack.Stats().TCP.ListenOverflowAckDrop.Increment()
 			e.stats.ReceiveErrors.ListenOverflowAckDrop.Increment()
 			e.stack.Stats().DroppedPackets.Increment()
@@ -654,6 +678,7 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 		// Validate the cookie.
 		data, ok := ctx.isCookieValid(s.id, iss, irs)
 		if !ok || int(data) >= len(mssTable) {
+			e.acceptMu.Unlock()
 			e.stack.Stats().TCP.ListenOverflowInvalidSynCookieRcvd.Increment()
 			e.stack.Stats().DroppedPackets.Increment()
 
@@ -695,6 +720,7 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 
 		n, err := ctx.createConnectingEndpoint(s, rcvdSynOptions, &waiter.Queue{})
 		if err != nil {
+			e.acceptMu.Unlock()
 			return err
 		}
 
@@ -706,6 +732,7 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 
 		if !n.reserveTupleLocked() {
 			n.mu.Unlock()
+			e.acceptMu.Unlock()
 			n.Close()
 
 			e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
@@ -723,6 +750,7 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 			n.boundBindToDevice,
 		); err != nil {
 			n.mu.Unlock()
+			e.acceptMu.Unlock()
 			n.Close()
 
 			e.stack.Stats().TCP.FailedConnectionAttempts.Increment()
@@ -755,20 +783,15 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 			n.newSegmentWaker.Assert()
 		}
 
-		// Do the delivery in a separate goroutine so
-		// that we don't block the listen loop in case
-		// the application is slow to accept or stops
-		// accepting.
-		//
-		// NOTE: This won't result in an unbounded
-		// number of goroutines as we do check before
-		// entering here that there was at least some
-		// space available in the backlog.
-
 		// Start the protocol goroutine.
 		n.startAcceptedLoop()
 		e.stack.Stats().TCP.PassiveConnectionOpenings.Increment()
-		go e.deliverAccepted(n, true /*withSynCookie*/)
+
+		// Deliver the endpoint to the accept queue.
+		e.accepted.endpoints.PushBack(n)
+		e.acceptMu.Unlock()
+
+		e.waiterQueue.Notify(waiter.ReadableEvents)
 		return nil
 
 	default:
@@ -785,9 +808,8 @@ func (e *endpoint) protocolListenLoop(rcvWnd seqnum.Size) {
 	ctx := newListenContext(e.stack, e.protocol, e, rcvWnd, v6Only, e.NetProto)
 
 	defer func() {
-		// Mark endpoint as closed. This will prevent goroutines running
-		// handleSynSegment() from attempting to queue new connections
-		// to the endpoint.
+		// Mark endpoint as closed. This will prevent goroutines performing
+		// handshakes from attempting to queue new connections to the endpoint.
 		e.setEndpointState(StateClose)
 
 		// Close any endpoints in SYN-RCVD state.

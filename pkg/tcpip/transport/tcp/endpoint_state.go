@@ -115,6 +115,22 @@ func (a *accepted) loadEndpoints(acceptedEndpoints []*endpoint) {
 	}
 }
 
+// savePendingSynRcvdConnectedEndpoints is invoked by stateify.
+func (a *accepted) savePendingSynRcvdConnectedEndpoints() []*endpoint {
+	pendingEndpoints := make([]*endpoint, a.pendingSynRcvdConnectedEndpoints.Len())
+	for i, e := 0, a.pendingSynRcvdConnectedEndpoints.Front(); e != nil; i, e = i+1, e.Next() {
+		pendingEndpoints[i] = e.Value.(*endpoint)
+	}
+	return pendingEndpoints
+}
+
+// loadPendingSynRcvdConnectedEndpoints is invoked by stateify.
+func (a *accepted) loadPendingSynRcvdConnectedEndpoints(pendingEndpoints []*endpoint) {
+	for _, ep := range pendingEndpoints {
+		a.pendingSynRcvdConnectedEndpoints.PushBack(ep)
+	}
+}
+
 // saveState is invoked by stateify.
 func (e *endpoint) saveState() EndpointState {
 	return e.EndpointState()
@@ -155,9 +171,6 @@ func (e *endpoint) afterLoad() {
 	// Restore the endpoint to InitialState as it will be moved to
 	// its origEndpointState during Resume.
 	e.state = uint32(StateInitial)
-	// Condition variables and mutexs are not S/R'ed so reinitialize
-	// acceptCond with e.acceptMu.
-	e.acceptCond = sync.NewCond(&e.acceptMu)
 	stack.StackFromEnv.RegisterRestoredEndpoint(e)
 }
 
@@ -251,7 +264,9 @@ func (e *endpoint) Resume(s *stack.Stack) {
 		go func() {
 			connectedLoading.Wait()
 			bind()
+			e.acceptMu.Lock()
 			backlog := e.accepted.cap
+			e.acceptMu.Unlock()
 			if err := e.Listen(backlog); err != nil {
 				panic("endpoint listening failed: " + err.String())
 			}
