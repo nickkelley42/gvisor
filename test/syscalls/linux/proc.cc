@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/magic.h>
+#include <linux/msg.h>
 #include <linux/sem.h>
 #include <sched.h>
 #include <signal.h>
@@ -2499,6 +2500,27 @@ TEST(ProcFilesystems, PresenceOfSem) {
   ASSERT_EQ(semmns, SEMMNS);
   ASSERT_EQ(semopm, SEMOPM);
   ASSERT_EQ(semmni, SEMMNI);
+}
+
+TEST(ProcFilesystems, PresenceOfMsgMniMaxMnb) {
+  uint64_t msgmni = 0;
+  uint64_t msgmax = 0;
+  uint64_t msgmnb = 0;
+
+  std::string proc_file;
+  proc_file = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/msgmni"));
+  ASSERT_FALSE(proc_file.empty());
+  ASSERT_TRUE(absl::SimpleAtoi(proc_file, &msgmni));
+  proc_file = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/msgmax"));
+  ASSERT_FALSE(proc_file.empty());
+  ASSERT_TRUE(absl::SimpleAtoi(proc_file, &msgmax));
+  proc_file = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/msgmnb"));
+  ASSERT_FALSE(proc_file.empty());
+  ASSERT_TRUE(absl::SimpleAtoi(proc_file, &msgmnb));
+
+  ASSERT_EQ(msgmni, MSGMNI);
+  ASSERT_EQ(msgmax, MSGMAX);
+  ASSERT_EQ(msgmnb, MSGMNB);
 }
 
 // Check that /proc/mounts is a symlink to self/mounts.

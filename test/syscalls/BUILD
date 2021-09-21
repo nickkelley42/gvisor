@@ -430,6 +430,7 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    tags = ["container"],
     test = "//test/syscalls/linux:proc_test",
 )
 
