@@ -86,7 +86,7 @@ func ExtractLinuxerrErrno(err error) *errors.Error {
 	case *errors.Error:
 		return e
 	case unix.Errno:
-		return linuxerr.ErrorFromErrno(errno.Errno(e))
+		return linuxerr.FromErrno(errno.Errno(e))
 	case *os.PathError:
 		return ExtractLinuxerrErrno(e.Err)
 	case *os.SyscallError:

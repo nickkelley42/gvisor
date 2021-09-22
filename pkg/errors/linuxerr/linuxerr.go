@@ -34,7 +34,7 @@ const maxErrno uint32 = errno.EHWPOISON + 1
 // (e.g. unix.Errno(EPERM.Errno()) == unix.EPERM is true). Converting unix/syscall.Errno
 // to the errors should be done via the lookup methods provided.
 var (
-	NOERROR = errors.New(errno.NOERRNO, "not an error")
+	noError = errors.New(errno.NOERRNO, "not an error")
 	EPERM   = errors.New(errno.EPERM, "operation not permitted")
 	ENOENT  = errors.New(errno.ENOENT, "no such file or directory")
 	ESRCH   = errors.New(errno.ESRCH, "no such process")
@@ -186,7 +186,7 @@ var errNotValidError = errors.New(errno.Errno(maxErrno), "not a valid error")
 // errnos (especially uint32(sycall.Errno)) and *errors.Error.
 var errorSlice = []*errors.Error{
 	// Errno values from include/uapi/asm-generic/errno-base.h.
-	errno.NOERRNO: NOERROR,
+	errno.NOERRNO: noError,
 	errno.EPERM:   EPERM,
 	errno.ENOENT:  ENOENT,
 	errno.ESRCH:   ESRCH,
@@ -324,8 +324,16 @@ var errorSlice = []*errors.Error{
 	errno.EHWPOISON:       EHWPOISON,
 }
 
-// ErrorFromErrno gets an error from the list and panics if an invalid entry is requested.
-func ErrorFromErrno(e errno.Errno) *errors.Error {
+// ErrorFromErrno gets a linuxerr as an error type from the list and panics if invalid error is requested.
+func ErrorFromErrno(e errno.Errno) error {
+	if e == 0 {
+		return nil
+	}
+	return FromErrno(e)
+}
+
+// FromErrno gets a linuxerr as an *error.Error type.
+func FromErrno(e errno.Errno) *errors.Error {
 	err := errorSlice[e]
 	// Done this way because a single comparison in benchmarks is 2-3 faster
 	// than something like ( if err == nil && err > 0 ).
@@ -339,10 +347,10 @@ func ErrorFromErrno(e errno.Errno) *errors.Error {
 // TODO(b/34162363): Remove when syserror is removed.
 func Equals(e *errors.Error, err error) bool {
 	if err == nil {
-		return e == NOERROR || e == nil
+		return e == noError || e == nil
 	}
 	if e == nil {
-		return err == NOERROR || err == unix.Errno(0)
+		return err == noError || err == unix.Errno(0)
 	}
 
 	switch err.(type) {

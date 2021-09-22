@@ -202,7 +202,7 @@ func TestSyscallErrnoToErrors(t *testing.T) {
 		t.Run(tc.errno.Error(), func(t *testing.T) {
 			e := linuxerr.ErrorFromErrno(errno.Errno(tc.errno))
 			if e != tc.err {
-				t.Fatalf("Mismatch errors: want: %+v (%d) got: %+v %d", tc.err, tc.err.Errno(), e, e.Errno())
+				t.Fatalf("Mismatch errors: want: %+v (%d) got: %+v", tc.err, tc.err.Errno(), e)
 			}
 		})
 	}
@@ -212,6 +212,7 @@ func TestSyscallErrnoToErrors(t *testing.T) {
 // unix.Errno and linuxerr.
 // TODO (b/34162363): Remove this.
 func TestEqualsMethod(t *testing.T) {
+	noError := linuxerr.FromErrno(0)
 	for _, tc := range []struct {
 		name     string
 		linuxErr []*gErrors.Error
@@ -220,20 +221,20 @@ func TestEqualsMethod(t *testing.T) {
 	}{
 		{
 			name:     "compare nil",
-			linuxErr: []*gErrors.Error{nil, linuxerr.NOERROR},
-			err:      []error{nil, linuxerr.NOERROR, unix.Errno(0)},
+			linuxErr: []*gErrors.Error{nil, noError},
+			err:      []error{nil, noError, unix.Errno(0)},
 			equal:    true,
 		},
 		{
 			name:     "linuxerr nil error not",
-			linuxErr: []*gErrors.Error{nil, linuxerr.NOERROR},
+			linuxErr: []*gErrors.Error{nil, noError},
 			err:      []error{unix.Errno(1), linuxerr.EPERM, linuxerr.EACCES},
 			equal:    false,
 		},
 		{
 			name:     "linuxerr not nil error nil",
 			linuxErr: []*gErrors.Error{linuxerr.ENOENT},
-			err:      []error{nil, unix.Errno(0), linuxerr.NOERROR},
+			err:      []error{nil, unix.Errno(0), noError},
 			equal:    false,
 		},
 		{
@@ -250,7 +251,7 @@ func TestEqualsMethod(t *testing.T) {
 		},
 		{
 			name:     "other error",
-			linuxErr: []*gErrors.Error{nil, linuxerr.NOERROR, linuxerr.E2BIG, linuxerr.EINVAL},
+			linuxErr: []*gErrors.Error{nil, noError, linuxerr.E2BIG, linuxerr.EINVAL},
 			err:      []error{fs.ErrInvalid, io.EOF},
 			equal:    false,
 		},
