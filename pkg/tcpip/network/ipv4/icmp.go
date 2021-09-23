@@ -167,7 +167,7 @@ func (e *endpoint) handleControl(errInfo stack.TransportError, pkt *stack.Packet
 	p := hdr.TransportProtocol()
 	dstAddr := hdr.DestinationAddress()
 	// Skip the ip header, then deliver the error.
-	pkt.Data().DeleteFront(hlen)
+	pkt.Data().MarkConsumed(hlen)
 	e.dispatcher.DeliverTransportError(srcAddr, dstAddr, ProtocolNumber, p, errInfo, pkt)
 }
 
@@ -338,7 +338,7 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer) {
 
 		mtu := h.MTU()
 		code := h.Code()
-		pkt.Data().DeleteFront(header.ICMPv4MinimumSize)
+		pkt.Data().MarkConsumed(header.ICMPv4MinimumSize)
 		switch code {
 		case header.ICMPv4HostUnreachable:
 			e.handleControl(&icmpv4DestinationHostUnreachableSockError{}, pkt)

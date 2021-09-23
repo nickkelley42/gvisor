@@ -138,7 +138,7 @@ func TestPacketBufferClone(t *testing.T) {
 		pk.Clone(),
 		pk.CloneToInbound(),
 	}
-	pk.Data().DeleteFront(bytesToDelete)
+	pk.buf.TrimFront(int64(bytesToDelete))
 	if got, want := pk.Data().Size(), originalSize-bytesToDelete; got != want {
 		t.Errorf("original packet was not changed: size expected = %d, got = %d", want, got)
 	}
@@ -461,11 +461,19 @@ func TestPacketBufferData(t *testing.T) {
 				}
 			})
 
-			// DeleteFront
+			// Consume.
 			for _, n := range []int{1, len(tc.data)} {
-				t.Run(fmt.Sprintf("DeleteFront%d", n), func(t *testing.T) {
+				t.Run(fmt.Sprintf("Consume%d", n), func(t *testing.T) {
 					pkt := tc.makePkt(t)
-					pkt.Data().DeleteFront(n)
+					v, ok := pkt.Data().Consume(n)
+					if !ok {
+						t.Error("Consume failed")
+						return
+					}
+					if want := []byte(tc.data)[:n]; !bytes.Equal(v, want) {
+						t.Errorf("pkt.Data().Consume(n) = 0x%x, want 0x%x", v, want)
+						return
+					}
 
 					checkData(t, pkt, []byte(tc.data)[n:])
 				})

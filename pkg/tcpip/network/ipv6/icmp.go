@@ -187,7 +187,7 @@ func (e *endpoint) handleControl(transErr stack.TransportError, pkt *stack.Packe
 
 	// Skip the IP header, then handle the fragmentation header if there
 	// is one.
-	pkt.Data().DeleteFront(header.IPv6MinimumSize)
+	pkt.Data().MarkConsumed(header.IPv6MinimumSize)
 	if p == header.IPv6FragmentHeader {
 		f, ok := pkt.Data().PullUp(header.IPv6FragmentHeaderSize)
 		if !ok {
@@ -203,7 +203,7 @@ func (e *endpoint) handleControl(transErr stack.TransportError, pkt *stack.Packe
 
 		// Skip fragmentation header and find out the actual protocol
 		// number.
-		pkt.Data().DeleteFront(header.IPv6FragmentHeaderSize)
+		pkt.Data().MarkConsumed(header.IPv6FragmentHeaderSize)
 	}
 
 	e.dispatcher.DeliverTransportError(srcAddr, dstAddr, ProtocolNumber, p, transErr, pkt)
@@ -325,7 +325,7 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 	switch icmpType := h.Type(); icmpType {
 	case header.ICMPv6PacketTooBig:
 		received.packetTooBig.Increment()
-		hdr, ok := pkt.Data().PullUp(header.ICMPv6PacketTooBigMinimumSize)
+		hdr, ok := pkt.Data().Consume(header.ICMPv6PacketTooBigMinimumSize)
 		if !ok {
 			received.invalid.Increment()
 			return
@@ -334,18 +334,16 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 		if err != nil {
 			networkMTU = 0
 		}
-		pkt.Data().DeleteFront(header.ICMPv6PacketTooBigMinimumSize)
 		e.handleControl(&icmpv6PacketTooBigSockError{mtu: networkMTU}, pkt)
 
 	case header.ICMPv6DstUnreachable:
 		received.dstUnreachable.Increment()
-		hdr, ok := pkt.Data().PullUp(header.ICMPv6DstUnreachableMinimumSize)
+		hdr, ok := pkt.Data().Consume(header.ICMPv6DstUnreachableMinimumSize)
 		if !ok {
 			received.invalid.Increment()
 			return
 		}
 		code := header.ICMPv6(hdr).Code()
-		pkt.Data().DeleteFront(header.ICMPv6DstUnreachableMinimumSize)
 		switch code {
 		case header.ICMPv6NetworkUnreachable:
 			e.handleControl(&icmpv6DestinationNetworkUnreachableSockError{}, pkt)
